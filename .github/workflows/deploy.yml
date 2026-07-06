@@ -1,0 +1,142 @@
+name: Deploy StatefulSet to OpenShift
+
+# Trigger: any push to the chosen deploy branch.
+# Change `deploy` below to whichever branch you want to promote from (main, release, etc.).
+on:
+  push:
+    branches:
+      - deploy
+    paths:
+      - 'manifests/**'
+      - 'tests/**'
+      - '.github/workflows/**'
+  # Lets you run the pipeline by hand from the Actions tab if you ever want to.
+  workflow_dispatch:
+
+# Cancel an older in-flight run if you push again quickly.
+concurrency:
+  group: openshift-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OC_VERSION: "4.15.0"           # OpenShift CLI version to install/cache
+  MANIFEST_PATH: "manifests/statefulset.yaml"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # STAGE 1 — Unit tests. Must pass before we go anywhere near the cluster.
+  # Results are written to the Actions job summary so you get a green/red badge.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run unit tests (fail fast)
+        run: |
+          set -o pipefail
+          pytest tests/ -v --maxfail=1 \
+            --junitxml=test-results.xml | tee pytest-output.txt
+
+      - name: Publish test results to Actions summary
+        if: always()
+        run: |
+          {
+            echo "## Unit Test Results"
+            echo ""
+            echo '```'
+            cat pytest-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 — Deploy. Only runs if the test job above succeeded (needs: test).
+  # Installs + caches oc, logs in with the token secret, applies the manifest.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to OpenShift
+    runs-on: ubuntu-latest
+    needs: test          # gate: deploy only if tests are green
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- Cache the oc binary so we don't re-download it every run ---
+      - name: Cache OpenShift CLI
+        id: cache-oc
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/oc
+          key: oc-cli-${{ env.OC_VERSION }}-linux
+
+      - name: Install OpenShift CLI (oc)
+        if: steps.cache-oc.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          URL="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OC_VERSION}/openshift-client-linux.tar.gz"
+          echo "Downloading oc ${OC_VERSION} ..."
+          curl -sSL "$URL" -o /tmp/oc.tar.gz
+          tar -xzf /tmp/oc.tar.gz -C "$HOME/.local/bin" oc
+          chmod +x "$HOME/.local/bin/oc"
+
+      - name: Add oc to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify oc
+        run: oc version --client
+
+      # --- Log in to the cluster using the token stored as a repo secret ---
+      - name: Log in to OpenShift
+        run: |
+          oc login "${{ secrets.OPENSHIFT_SERVER }}" \
+            --token="${{ secrets.OPENSHIFT_TOKEN }}" \
+            --insecure-skip-tls-verify=${{ vars.OPENSHIFT_INSECURE_TLS || 'false' }}
+          echo "Logged in as: $(oc whoami)"
+
+      - name: Select project / namespace
+        run: oc project "${{ vars.OPENSHIFT_NAMESPACE }}"
+
+      # --- Sanity-check the manifest, then apply it ---
+      - name: Validate manifest (dry-run)
+        run: oc apply -f "${MANIFEST_PATH}" --dry-run=server
+
+      - name: Apply StatefulSet
+        run: oc apply -f "${MANIFEST_PATH}"
+
+      - name: Wait for rollout
+        run: |
+          NAME=$(oc get -f "${MANIFEST_PATH}" -o jsonpath='{.metadata.name}')
+          echo "Waiting for StatefulSet/${NAME} to roll out ..."
+          oc rollout status "statefulset/${NAME}" --timeout=180s
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "## Deployment"
+            echo ""
+            echo "Namespace: \`${{ vars.OPENSHIFT_NAMESPACE }}\`"
+            echo ""
+            echo '```'
+            oc get statefulset,pods -o wide 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
